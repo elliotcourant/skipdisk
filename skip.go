@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"os"
 	"path"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 )
@@ -49,11 +50,13 @@ type (
 		endLevels    [MaxLevel]nodeRef
 		maxNewLevel  uint8
 		maxLevel     uint8
-		elementCount int
+		elementCount uint64
 
 		segmentReadLock  sync.RWMutex
 		segmentWriteLock sync.Mutex
 		segments         map[fileRef]*segment
+
+		root *os.File
 	}
 )
 
@@ -78,9 +81,20 @@ func (f fileRef) GetFilename() string {
 }
 
 func NewDB(directory string) *DB {
-	return &DB{
+	dir, err := filepath.Abs(directory)
+	if err != nil {
+		panic(err)
+	}
+	if err := newDirectory(dir); err != nil {
+		panic(err)
+	}
+	if err := takeOwnership(dir); err != nil {
+		panic(err)
+	}
+
+	db := &DB{
 		nextFileId:   0,
-		directory:    directory,
+		directory:    dir,
 		startLevels:  [MaxLevel]nodeRef{},
 		endLevels:    [MaxLevel]nodeRef{},
 		maxNewLevel:  0,
@@ -88,6 +102,77 @@ func NewDB(directory string) *DB {
 		elementCount: 0,
 		segments:     map[fileRef]*segment{},
 	}
+
+	rootFileId := fileRef(0)
+
+	db.readRoot(db.getPath(rootFileId))
+
+	return db
+}
+
+func (db *DB) readRoot(path string) {
+	takeOwnership(path)
+	flags := os.O_CREATE | os.O_RDWR | os.O_SYNC
+	mode := os.ModeAppend | os.ModePerm
+	file, err := os.OpenFile(path, flags, mode)
+	if err != nil {
+		panic(err)
+	}
+
+	db.root = file
+
+	stat, _ := file.Stat()
+	if stat.Size() == 0 {
+		db.nextFileId++
+		return
+	}
+
+	offset := int64(0)
+
+	for i := 0; i < int(MaxLevel); i++ {
+		ref := make([]byte, 8)
+		if _, err := file.ReadAt(ref, offset); err != nil {
+			panic(err)
+		}
+		offset += 8
+
+		db.startLevels[i] = nodeRef(binary.BigEndian.Uint64(ref))
+	}
+
+	for i := 0; i < int(MaxLevel); i++ {
+		ref := make([]byte, 8)
+		if _, err := file.ReadAt(ref, offset); err != nil {
+			panic(err)
+		}
+		offset += 8
+
+		db.endLevels[i] = nodeRef(binary.BigEndian.Uint64(ref))
+	}
+
+	src := make([]byte, 4+1+1+8)
+	if _, err := file.ReadAt(src, offset); err != nil {
+		panic(err)
+	}
+	buf := buffers.NewBytesReader(src)
+	db.nextFileId = fileRef(buf.NextUint32())
+	db.maxNewLevel = buf.NextUint8()
+	db.maxLevel = buf.NextUint8()
+	db.elementCount = buf.NextUint64()
+}
+
+func (db *DB) writeRoot() {
+	buf := buffers.NewBytesBuffer()
+	for _, ref := range db.startLevels {
+		buf.AppendUint64(uint64(ref))
+	}
+	for _, ref := range db.endLevels {
+		buf.AppendUint64(uint64(ref))
+	}
+	buf.AppendUint32(uint32(db.nextFileId))
+	buf.AppendUint8(db.maxNewLevel)
+	buf.AppendUint8(db.maxLevel)
+	buf.AppendUint64(db.elementCount)
+	db.root.WriteAt(buf.Bytes(), 0)
 }
 
 func (db *DB) IsEmpty() bool {
@@ -95,9 +180,15 @@ func (db *DB) IsEmpty() bool {
 }
 
 func (db *DB) Close() {
+	db.writeRoot()
 	for _, segment := range db.segments {
+		segment.file.Sync()
 		segment.file.Close()
 	}
+}
+
+func (db *DB) getPath(fileId fileRef) string {
+	return path.Join(db.directory, fileId.GetFilename())
 }
 
 func (db *DB) generateLevel(maxLevel uint8) uint8 {
@@ -244,7 +335,10 @@ func (db *DB) Insert(key []byte) {
 
 			// Connect node to next
 			if index <= level && (nextNode == nil || bytes.Compare(nextNode.key, elem.key) > 0) {
-				db.updateNext(elem, index, nextNode.ref)
+				if nextNode != nil {
+					db.updateNext(elem, index, nextNode.ref)
+				}
+
 				if currentNode != nil {
 					db.updateNext(currentNode, index, elem.ref)
 				}
@@ -268,7 +362,7 @@ func (db *DB) Insert(key []byte) {
 			} else {
 				// Go Down
 				index--
-				if index < 0 {
+				if index < 0 || index == 255 {
 					break
 				}
 			}
@@ -328,8 +422,6 @@ func (db *DB) Insert(key []byte) {
 			break
 		}
 	}
-
-	db.currentSegment().Sync()
 }
 
 func (db *DB) updateNext(node *Node, index uint8, ref nodeRef) {
@@ -364,9 +456,9 @@ func (db *DB) getSegment(fileId fileRef) *segment {
 		db.segmentReadLock.RUnlock()
 		db.segmentReadLock.Lock()
 
-		filePath := path.Join(db.directory, fileId.GetFilename())
+		filePath := db.getPath(fileId)
 
-		os.Chown(filePath, os.Getuid(), os.Getgid())
+		takeOwnership(filePath)
 
 		flags := os.O_CREATE | os.O_RDWR | os.O_SYNC
 		mode := os.ModeAppend | os.ModePerm

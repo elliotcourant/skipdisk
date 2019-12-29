@@ -182,7 +182,7 @@ func (db *DB) IsEmpty() bool {
 func (db *DB) Close() {
 	db.writeRoot()
 	for _, segment := range db.segments {
-		segment.file.Sync()
+		segment.Sync()
 		segment.file.Close()
 	}
 }
@@ -285,8 +285,6 @@ func (db *DB) FindGreaterOrEqual(key []byte) (node *Node, ok bool) {
 }
 
 func (db *DB) Insert(key []byte) {
-	// start := time.Now()
-	// defer fmt.Println("insert took:", time.Since(start))
 	if db == nil || key == nil {
 		return
 	}
@@ -324,7 +322,8 @@ func (db *DB) Insert(key []byte) {
 		index := db.findEntryIndex(elem.key, level)
 
 		var currentNode *Node
-		nextNode := db.getReference(db.startLevels[index])
+		var nextNode *Node
+		// nextNode := db.getReference(db.startLevels[index])
 
 		for {
 			if currentNode == nil {
@@ -356,9 +355,11 @@ func (db *DB) Insert(key []byte) {
 				}
 			}
 
-			if nextNode != nil && bytes.Compare(nextNode.key, elem.key) <= 0 {
+			if nextNode != nil && bytes.Compare(nextNode.key, elem.key) < 0 {
 				// Go Right
 				currentNode = nextNode
+			} else if nextNode != nil && bytes.Compare(nextNode.key, elem.key) == 0 {
+				return
 			} else {
 				// Go Down
 				index--
@@ -504,11 +505,15 @@ func (db *DB) currentSegment() *segment {
 
 func (seg *segment) GetNode(offset uint32) *Node {
 	sizeBinary := make([]byte, 2)
-	if _, err := seg.file.ReadAt(sizeBinary, int64(offset)); err != nil {
+	start := int64(offset)
+	if _, err := seg.file.ReadAt(sizeBinary, start); err != nil {
 		panic(err)
 	}
-
-	nodeData := make([]byte, binary.BigEndian.Uint16(sizeBinary)-2)
+	size := binary.BigEndian.Uint16(sizeBinary)
+	if size == 0 {
+		return nil
+	}
+	nodeData := make([]byte, size-2)
 	if _, err := seg.file.ReadAt(nodeData, int64(offset)+2); err != nil {
 		panic(err)
 	}

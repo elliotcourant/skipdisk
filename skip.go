@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"github.com/dgraph-io/ristretto"
 	"github.com/elliotcourant/buffers"
 	"math/bits"
 	"math/rand"
@@ -16,8 +17,9 @@ import (
 )
 
 const (
-	MaxLevel     uint8   = 25
-	nilReference nodeRef = 0
+	MaxSegmentSize uint16  = 1024 * 8 // 8kb
+	MaxLevel       uint8   = 25
+	nilReference   nodeRef = 0
 )
 
 type (
@@ -44,6 +46,7 @@ type (
 	}
 
 	DB struct {
+		nextFileLock sync.Mutex
 		nextFileId   fileRef
 		directory    string
 		startLevels  [MaxLevel]nodeRef
@@ -55,6 +58,8 @@ type (
 		segmentReadLock  sync.RWMutex
 		segmentWriteLock sync.Mutex
 		segments         map[fileRef]*segment
+
+		cache *ristretto.Cache
 
 		root *os.File
 	}
@@ -92,6 +97,15 @@ func NewDB(directory string) *DB {
 		panic(err)
 	}
 
+	cache, err := ristretto.NewCache(&ristretto.Config{
+		NumCounters: 1e6,     // number of keys to track frequency of (10M).
+		MaxCost:     1 << 30, // maximum cost of cache (1GB).
+		BufferItems: 64,      // number of keys per Get buffer.
+	})
+	if err != nil {
+		panic(err)
+	}
+
 	db := &DB{
 		nextFileId:   0,
 		directory:    dir,
@@ -101,6 +115,7 @@ func NewDB(directory string) *DB {
 		maxLevel:     0,
 		elementCount: 0,
 		segments:     map[fileRef]*segment{},
+		cache:        cache,
 	}
 
 	rootFileId := fileRef(0)
@@ -111,10 +126,10 @@ func NewDB(directory string) *DB {
 }
 
 func (db *DB) readRoot(path string) {
-	takeOwnership(path)
+	// takeOwnership(path)
 	flags := os.O_CREATE | os.O_RDWR | os.O_SYNC
-	mode := os.ModeAppend | os.ModePerm
-	file, err := os.OpenFile(path, flags, mode)
+	// mode := os.ModeAppend | os.ModePerm
+	file, err := os.OpenFile(path, flags, 0777)
 	if err != nil {
 		panic(err)
 	}
@@ -289,6 +304,18 @@ func (db *DB) Insert(key []byte) {
 		return
 	}
 
+	readNodes := map[nodeRef]*Node{}
+
+	getReference := func(ref nodeRef) *Node {
+		if node, ok := readNodes[ref]; ok {
+			return node
+		} else {
+			node = db.getReference(ref)
+			readNodes[ref] = node
+			return node
+		}
+	}
+
 	level := db.generateLevel(db.maxNewLevel)
 
 	if level > db.maxLevel {
@@ -309,8 +336,8 @@ func (db *DB) Insert(key []byte) {
 	newFirst, newLast := true, true
 
 	if !db.IsEmpty() {
-		newFirst = bytes.Compare(elem.key, db.getReference(db.startLevels[0]).key) < 0
-		newLast = bytes.Compare(elem.key, db.getReference(db.endLevels[0]).key) > 0
+		newFirst = bytes.Compare(elem.key, getReference(db.startLevels[0]).key) < 0
+		newLast = bytes.Compare(elem.key, getReference(db.endLevels[0]).key) > 0
 	}
 
 	plugWrites := make([]func(), 0)
@@ -351,9 +378,9 @@ func (db *DB) Insert(key []byte) {
 
 		for {
 			if currentNode == nil {
-				nextNode = db.getReference(db.startLevels[index])
+				nextNode = getReference(db.startLevels[index])
 			} else {
-				nextNode = db.getReference(currentNode.next[index])
+				nextNode = getReference(currentNode.next[index])
 			}
 
 			// Connect node to next
@@ -398,7 +425,7 @@ func (db *DB) Insert(key []byte) {
 		didSomething := false
 
 		if newFirst || normallyInserted {
-			if node := db.getReference(db.startLevels[i]); node == nil || bytes.Compare(node.key, elem.key) > 0 {
+			if node := getReference(db.startLevels[i]); node == nil || bytes.Compare(node.key, elem.key) > 0 {
 				if i == 0 && node != nil {
 					deferUpdatePrev(node)
 				}
@@ -413,7 +440,7 @@ func (db *DB) Insert(key []byte) {
 			}
 
 			// link the endLevels to this element!
-			if db.getReference(elem.next[i]) == nil {
+			if getReference(elem.next[i]) == nil {
 				deferUpdateEnd(i)
 			}
 
@@ -424,7 +451,7 @@ func (db *DB) Insert(key []byte) {
 			// Places the element after the very last element on this level!
 			// This is very important, so we are not linking the very first element (newFirst AND newLast) to itself!
 			if !newFirst {
-				if node := db.getReference(db.endLevels[i]); node != nil {
+				if node := getReference(db.endLevels[i]); node != nil {
 					deferUpdateNext(node, i)
 				}
 
@@ -436,7 +463,7 @@ func (db *DB) Insert(key []byte) {
 			}
 
 			// Link the startLevels to this element!
-			if node := db.getReference(db.startLevels[i]); node == nil || bytes.Compare(node.key, elem.key) > 0 {
+			if node := getReference(db.startLevels[i]); node == nil || bytes.Compare(node.key, elem.key) > 0 {
 				deferUpdateStart(i)
 			}
 
@@ -448,7 +475,7 @@ func (db *DB) Insert(key []byte) {
 		}
 	}
 
-	db.currentSegment().Append(elem)
+	db.append(elem)
 	for _, plug := range plugWrites {
 		plug()
 	}
@@ -471,11 +498,19 @@ func (db *DB) getReference(ref nodeRef) *Node {
 		return nil
 	}
 
+	// if n, ok := db.cache.Get(uint64(ref)); ok {
+	// 	addr := n.(uintptr)
+	// 	return (*Node)(unsafe.Pointer(addr))
+	// }
+
 	fileId, offset := ref.Get()
 
 	seg := db.getSegment(fileId)
 
-	return seg.GetNode(offset)
+	node := seg.GetNode(offset)
+	// addr := uintptr(unsafe.Pointer(node))
+	// db.cache.Set(uint64(ref), addr, 1)
+	return node
 }
 
 func (db *DB) getSegment(fileId fileRef) *segment {
@@ -504,6 +539,7 @@ func (db *DB) getSegment(fileId fileRef) *segment {
 		if stats.Size() < 4 {
 			// Empty file.
 			space = 4
+			file.Write(make([]byte, MaxSegmentSize))
 		} else {
 			s := make([]byte, 4)
 			if _, err := file.ReadAt(s, 0); err != nil {
@@ -518,6 +554,10 @@ func (db *DB) getSegment(fileId fileRef) *segment {
 			space:  space,
 		}
 
+		if space == 4 {
+			seg.Sync()
+		}
+
 		db.segments[fileId] = seg
 		db.segmentWriteLock.Unlock()
 		db.segmentReadLock.Unlock()
@@ -526,6 +566,28 @@ func (db *DB) getSegment(fileId fileRef) *segment {
 	}
 
 	return seg
+}
+
+func (db *DB) append(node *Node) {
+	size := node.Size()
+
+	tooBig := func() bool {
+		return db.currentSegment().space+uint32(size) > uint32(MaxSegmentSize)
+	}
+	// If inserting the current node would push this segment over 8kb then create a new thing.
+	if tooBig() {
+		// Obtain a lock to create a new file.
+		db.nextFileLock.Lock()
+		defer db.nextFileLock.Unlock()
+
+		// Make sure that the status has not changed while we grabbing the lock.
+		if tooBig() {
+			atomic.AddUint32((*uint32)(&db.nextFileId), 1)
+			db.writeRoot()
+		}
+	}
+
+	db.currentSegment().Append(node)
 }
 
 func (db *DB) currentSegment() *segment {

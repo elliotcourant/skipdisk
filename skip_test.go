@@ -1,6 +1,7 @@
 package skipdisk
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"testing"
@@ -8,24 +9,36 @@ import (
 )
 
 func TestSkip(t *testing.T) {
-	db := NewDB("")
+	db := NewDB("data")
 	defer db.Close()
 
-	for i := 0; i < 1000; i++ {
+	keys := make([][]byte, 100)
+	for i := range keys {
 		k := make([]byte, 8)
 		binary.BigEndian.PutUint64(k, uint64(i))
-		db.Insert(k)
+		keys[i] = k
 	}
+
+	start := time.Now()
+	for _, key := range keys {
+		db.Insert(key)
+	}
+	end := time.Since(start)
+	fmt.Println("insert took:", end, "at", time.Duration(int64(end)/int64(len(keys))), "per insert, and",
+		float64(len(keys))/end.Minutes(), "inserts per minute")
 
 	itr := db.NewIterator()
 
-	start := time.Now()
+	start = time.Now()
 	itr.Rewind()
-	for i := 0; i < 1000; i++ {
-		fmt.Printf("Address: %d Key: %v\n", itr.Item().ref, itr.Item().key)
+	for i := 0; i < len(keys); i++ {
+		if bytes.Compare(keys[i], itr.Item().key) != 0 {
+			panic("invalid order")
+		}
 		itr.Next()
 	}
-	fmt.Println("iteration took:", time.Since(start))
+	end = time.Since(start)
+	fmt.Println("iteration took:", end)
 
 	fmt.Println("test")
 }

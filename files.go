@@ -70,5 +70,5 @@ func createDirectory(path string) error {
 
 // takeOwnership will change the owner of the path specified to be such that the DB has ownership.
 func takeOwnership(path string) error {
-	return os.Chown(path, os.Getuid(), os.Getgid())
+	return os.Chmod(path, 0777)
 }

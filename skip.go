@@ -304,8 +304,6 @@ func (db *DB) Insert(key []byte) {
 		prev:  0,
 	}
 
-	db.currentSegment().Append(elem)
-
 	db.elementCount++
 
 	newFirst, newLast := true, true
@@ -313,6 +311,32 @@ func (db *DB) Insert(key []byte) {
 	if !db.IsEmpty() {
 		newFirst = bytes.Compare(elem.key, db.getReference(db.startLevels[0]).key) < 0
 		newLast = bytes.Compare(elem.key, db.getReference(db.endLevels[0]).key) > 0
+	}
+
+	plugWrites := make([]func(), 0)
+
+	deferUpdateNext := func(node *Node, index uint8) {
+		plugWrites = append(plugWrites, func() {
+			db.updateNext(node, index, elem.ref)
+		})
+	}
+
+	deferUpdatePrev := func(node *Node) {
+		plugWrites = append(plugWrites, func() {
+			db.updatePrev(node, elem.ref)
+		})
+	}
+
+	deferUpdateStart := func(index uint8) {
+		plugWrites = append(plugWrites, func() {
+			db.startLevels[index] = elem.ref
+		})
+	}
+
+	deferUpdateEnd := func(index uint8) {
+		plugWrites = append(plugWrites, func() {
+			db.endLevels[index] = elem.ref
+		})
 	}
 
 	normallyInserted := false
@@ -335,22 +359,22 @@ func (db *DB) Insert(key []byte) {
 			// Connect node to next
 			if index <= level && (nextNode == nil || bytes.Compare(nextNode.key, elem.key) > 0) {
 				if nextNode != nil {
-					db.updateNext(elem, index, nextNode.ref)
+					elem.next[index] = nextNode.ref
 				}
 
 				if currentNode != nil {
-					db.updateNext(currentNode, index, elem.ref)
+					deferUpdateNext(currentNode, index)
 				}
 
 				if index == 0 {
 					if currentNode != nil {
-						db.updatePrev(elem, currentNode.ref)
+						elem.prev = currentNode.ref
 					} else {
-						db.updatePrev(elem, nilReference)
+						elem.prev = nilReference
 					}
 
 					if nextNode != nil {
-						db.updatePrev(nextNode, elem.ref)
+						deferUpdatePrev(nextNode)
 					}
 				}
 			}
@@ -376,21 +400,21 @@ func (db *DB) Insert(key []byte) {
 		if newFirst || normallyInserted {
 			if node := db.getReference(db.startLevels[i]); node == nil || bytes.Compare(node.key, elem.key) > 0 {
 				if i == 0 && node != nil {
-					db.updatePrev(node, elem.ref)
+					deferUpdatePrev(node)
 				}
 
 				if node != nil {
-					db.updateNext(elem, i, node.ref)
+					elem.next[i] = node.ref
 				} else {
-					db.updateNext(elem, i, nilReference)
+					elem.next[i] = nilReference
 				}
 
-				db.startLevels[i] = elem.ref
+				deferUpdateStart(i)
 			}
 
 			// link the endLevels to this element!
 			if db.getReference(elem.next[i]) == nil {
-				db.endLevels[i] = elem.ref
+				deferUpdateEnd(i)
 			}
 
 			didSomething = true
@@ -401,19 +425,19 @@ func (db *DB) Insert(key []byte) {
 			// This is very important, so we are not linking the very first element (newFirst AND newLast) to itself!
 			if !newFirst {
 				if node := db.getReference(db.endLevels[i]); node != nil {
-					db.updateNext(node, i, elem.ref)
+					deferUpdateNext(node, i)
 				}
 
 				if i == 0 {
-					db.updatePrev(elem, db.endLevels[i])
+					elem.prev = db.endLevels[i]
 				}
 
-				db.endLevels[i] = elem.ref
+				deferUpdateEnd(i)
 			}
 
 			// Link the startLevels to this element!
 			if node := db.getReference(db.startLevels[i]); node == nil || bytes.Compare(node.key, elem.key) > 0 {
-				db.startLevels[i] = elem.ref
+				deferUpdateStart(i)
 			}
 
 			didSomething = true
@@ -422,6 +446,11 @@ func (db *DB) Insert(key []byte) {
 		if !didSomething {
 			break
 		}
+	}
+
+	db.currentSegment().Append(elem)
+	for _, plug := range plugWrites {
+		plug()
 	}
 }
 
